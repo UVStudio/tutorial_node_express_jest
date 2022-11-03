@@ -1,7 +1,9 @@
 const app = require('./src/app');
 const sequelize = require('./src/config/database');
 
-sequelize.sync();
+sequelize.sync({
+  force: true, //in test only, never production
+});
 
 app.listen(5000, () => {
   console.log('Server running on 5000');
