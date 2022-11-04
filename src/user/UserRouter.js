@@ -1,6 +1,5 @@
 const express = require('express');
 const router = express.Router();
-const User = require('./User');
 const UserService = require('./UserService');
 const { check, validationResult } = require('express-validator');
 
@@ -49,10 +48,14 @@ router.post(
       return res.status(400).send({ validationErrors });
     }
 
-    await UserService.createUser(req.body);
-    return res.send({
-      message: 'user created',
-    });
+    try {
+      await UserService.createUser(req.body);
+      return res.send({
+        message: 'user created',
+      });
+    } catch (error) {
+      res.status(502).send({ message: error.message });
+    }
   }
 );
 

@@ -2,6 +2,8 @@ const request = require('supertest');
 const app = require('../src/app');
 const User = require('../src/user/User');
 const sequelize = require('../src/config/database');
+const nodeMailerStub = require('nodemailer-stub');
+const EmailService = require('../src/email/EmailService');
 
 const validUser = {
   username: 'user1',
@@ -45,6 +47,7 @@ beforeEach(() => {
 });
 
 describe('User registration', () => {
+  //VALID USER INPUT
   it('returns 200 ok when sign up request is valid', async () => {
     const response = await postUser();
     expect(response.status).toBe(200);
@@ -76,6 +79,7 @@ describe('User registration', () => {
     expect(savedUser.password).not.toBe('P4ssword');
   });
 
+  //INVALID USER INPUT
   it('returns 400 when username is null or empty string', async () => {
     const response = await postUser(invalidUsername);
     expect(response.status).toBe(400);
@@ -96,6 +100,77 @@ describe('User registration', () => {
       'username',
       'email',
     ]); // the order of the array items is important, needs be same as order of middleware validation functions
+  });
+
+  //USER CREATION - INACTIVE AND TOKEN
+  it('creates user in inactive mode', async () => {
+    await postUser();
+    const users = await User.findAll();
+    const savedUser = users[0];
+    expect(savedUser.inactive).toBe(true);
+  });
+
+  it('creates user in inactive mode, even if the req body contains inactive as false', async () => {
+    const newUser = { ...validUser, inactive: false };
+    await postUser(newUser);
+    const users = await User.findAll();
+    const savedUser = users[0];
+    expect(savedUser.inactive).toBe(true);
+  });
+
+  it('creates an activation token for user', async () => {
+    const newUser = { ...validUser, inactive: false };
+    await postUser(newUser);
+    const users = await User.findAll();
+    const savedUser = users[0];
+    expect(savedUser.activationToken).toBeTruthy();
+  });
+
+  //ACTIVATION EMAIL
+  it('sends an activation email with activationToken', async () => {
+    await postUser();
+    const lastMail = nodeMailerStub.interactsWithMail.lastMail();
+    // console.log('lastmail: ', lastMail);
+    // expect(lastMail.to).toContain('user1@mail.com');
+    expect(lastMail.to[0]).toBe('user1@mail.com');
+    const users = await User.findAll();
+    const savedUser = users[0];
+    expect(lastMail.content).toContain(savedUser.activationToken);
+  });
+
+  it('returns 502 Bad Gateway when sending email fails', async () => {
+    const mockSendAccountActivation = jest
+      .spyOn(EmailService, 'sendAccountActivation') //spy observes behaviour of functions
+      .mockRejectedValue({
+        message: 'Failed to deliver email',
+      });
+    //console.log('mockSendAccountActivation: ', mockSendAccountActivation);
+    const response = await postUser();
+    expect(response.status).toBe(502);
+    mockSendAccountActivation.mockRestore();
+  });
+
+  it('returns Email failure when sending email fails', async () => {
+    const mockSendAccountActivation = jest
+      .spyOn(EmailService, 'sendAccountActivation')
+      .mockRejectedValue({
+        message: 'Failed to deliver email',
+      });
+    const response = await postUser();
+    mockSendAccountActivation.mockRestore();
+    expect(response.body.message).toBe('Email failure');
+  });
+
+  it('does not save user to DB if activation email fails', async () => {
+    const mockSendAccountActivation = jest
+      .spyOn(EmailService, 'sendAccountActivation')
+      .mockRejectedValue({
+        message: 'Failed to deliver email',
+      });
+    await postUser();
+    mockSendAccountActivation.mockRestore();
+    const users = await User.findAll();
+    expect(users.length).toBe(0);
   });
 
   it.each`
