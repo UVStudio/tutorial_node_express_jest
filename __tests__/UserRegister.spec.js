@@ -2,8 +2,7 @@ const request = require('supertest');
 const app = require('../src/app');
 const User = require('../src/user/User');
 const sequelize = require('../src/config/database');
-const nodeMailerStub = require('nodemailer-stub');
-const EmailService = require('../src/email/EmailService');
+const SMTPServer = require('smtp-server').SMTPServer;
 
 const validUser = {
   username: 'user1',
@@ -17,33 +16,51 @@ const invalidUsername = {
   password: 'P4ssword',
 };
 
-const invalidEmail = {
-  username: 'user1',
-  email: null,
-  password: 'P4ssword',
-};
-
-const invalidPassword = {
-  username: 'user1',
-  email: 'user1@mail.com',
-  password: null,
-};
-
 const postUser = (user = validUser) => {
   return request(app).post(userRoute).send(user);
 };
 
 const userRoute = '/api/1.0/users';
 
-beforeAll(() => {
+let lastMail, server;
+let simulateSMTPFailure = false;
+
+beforeAll(async () => {
+  //initialize email server
+  server = new SMTPServer({
+    authOptional: true,
+    onData(stream, session, callback) {
+      let mailBody;
+      stream.on('data', (data) => {
+        mailBody += data.toString();
+      });
+      stream.on('end', () => {
+        if (simulateSMTPFailure) {
+          const err = new Error('Invalid mailbox');
+          err.responseCode = 553;
+          return callback(err);
+        }
+        lastMail = mailBody;
+        callback();
+      });
+    },
+  });
+  await server.listen(8587, 'localhost');
+
   //initialize database
   return sequelize.sync();
 });
 
 beforeEach(() => {
+  //default SMTP is to not fail. Tests that simulate email fail are set to true
+  simulateSMTPFailure = false;
   //deleting saved user from database before each 'it' test
   //or else users would accumulate in the DB
   return User.destroy({ truncate: true });
+});
+
+afterAll(async () => {
+  await server.close();
 });
 
 describe('User registration', () => {
@@ -129,50 +146,32 @@ describe('User registration', () => {
   //ACTIVATION EMAIL
   it('sends an activation email with activationToken', async () => {
     await postUser();
-    const lastMail = nodeMailerStub.interactsWithMail.lastMail();
-    // console.log('lastmail: ', lastMail);
-    // expect(lastMail.to).toContain('user1@mail.com');
-    expect(lastMail.to[0]).toBe('user1@mail.com');
     const users = await User.findAll();
     const savedUser = users[0];
-    expect(lastMail.content).toContain(savedUser.activationToken);
+    expect(lastMail).toContain('user1@mail.com');
+    expect(lastMail).toContain(savedUser.activationToken);
   });
 
   it('returns 502 Bad Gateway when sending email fails', async () => {
-    const mockSendAccountActivation = jest
-      .spyOn(EmailService, 'sendAccountActivation') //spy observes behaviour of functions
-      .mockRejectedValue({
-        message: 'Failed to deliver email',
-      });
-    //console.log('mockSendAccountActivation: ', mockSendAccountActivation);
+    simulateSMTPFailure = true;
     const response = await postUser();
     expect(response.status).toBe(502);
-    mockSendAccountActivation.mockRestore();
   });
 
   it('returns Email failure when sending email fails', async () => {
-    const mockSendAccountActivation = jest
-      .spyOn(EmailService, 'sendAccountActivation')
-      .mockRejectedValue({
-        message: 'Failed to deliver email',
-      });
+    simulateSMTPFailure = true;
     const response = await postUser();
-    mockSendAccountActivation.mockRestore();
     expect(response.body.message).toBe('Email failure');
   });
 
   it('does not save user to DB if activation email fails', async () => {
-    const mockSendAccountActivation = jest
-      .spyOn(EmailService, 'sendAccountActivation')
-      .mockRejectedValue({
-        message: 'Failed to deliver email',
-      });
+    simulateSMTPFailure = true;
     await postUser();
-    mockSendAccountActivation.mockRestore();
     const users = await User.findAll();
     expect(users.length).toBe(0);
   });
 
+  //USER INPUT VALIDATIONS ERROR MESSAGES
   it.each`
     field         | value                 | expectedMessage
     ${'username'} | ${null}               | ${'Username cannot be null'}
@@ -222,4 +221,72 @@ describe('User registration', () => {
       'email',
     ]);
   });
+});
+
+describe('Account Activation', () => {
+  it('activates the account when correct token is sent', async () => {
+    await postUser();
+    let users = await User.findAll();
+    const token = users[0].activationToken;
+
+    await request(app)
+      .post('/api/1.0/users/token/' + token)
+      .send();
+    users = await User.findAll();
+    expect(users[0].inactive).toBe(false);
+  });
+
+  it('removes the token from user table after successful activation', async () => {
+    await postUser();
+    let users = await User.findAll();
+    const token = users[0].activationToken;
+
+    await request(app)
+      .post('/api/1.0/users/token/' + token)
+      .send();
+    users = await User.findAll();
+    expect(users[0].activationToken).toBeFalsy();
+  });
+
+  it('does not activate account when token is wrong', async () => {
+    await postUser();
+    const token = 'this-is-wrong-token';
+
+    await request(app)
+      .post('/api/1.0/users/token/' + token)
+      .send();
+    let users = await User.findAll();
+    expect(users[0].inactive).toBe(true);
+  });
+
+  it('returns bad request when token is wrong', async () => {
+    await postUser();
+    const token = 'this-is-wrong-token';
+
+    const response = await request(app)
+      .post('/api/1.0/users/token/' + token)
+      .send();
+    expect(response.status).toBe(400);
+  });
+
+  it.each`
+    tokenStatus  | message
+    ${'wrong'}   | ${'Invalid Token'}
+    ${'correct'} | ${'Account is activated'}
+  `(
+    'returns $message when $tokenStatus token is sent',
+    async ({ tokenStatus, message }) => {
+      await postUser();
+      let token = 'this-is-wrong-token';
+      if (tokenStatus === 'correct') {
+        let users = await User.findAll();
+        token = users[0].activationToken;
+      }
+
+      const response = await request(app)
+        .post('/api/1.0/users/token/' + token)
+        .send();
+      expect(response.body.message).toBe(message);
+    }
+  );
 });
